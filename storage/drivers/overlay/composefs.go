@@ -216,6 +216,23 @@ func openComposefsMount(dataDir string) (int, error) {
 	return openBlobFile(blobFile, hasACL, true)
 }
 
+// mountComposefsLayer mounts at mountPoint an overlay of the composefs blob
+// mounted at blobMountPoint, with the layer's diffDir as data-only lower, as
+// mount.composefs does.  Overlay then applies the whiteouts and opaque
+// directories that mkcomposefs escapes in the blob, and the 00-ff whiteouts at
+// the blob root hide diffDir only, not the lower layers.
+func mountComposefsLayer(blobMountPoint, diffDir, mountPoint string, supportsDataOnly bool, opts []string) error {
+	sep := "::"
+	if !supportsDataOnly {
+		sep = ":"
+	}
+	data := strings.Join(append([]string{"lowerdir=" + blobMountPoint + sep + diffDir}, opts...), ",")
+	if err := unix.Mount("overlay", mountPoint, "overlay", unix.MS_RDONLY, data); err != nil {
+		return fmt.Errorf("mounting composefs layer %q at %q: %w", diffDir, mountPoint, err)
+	}
+	return nil
+}
+
 func mountComposefsBlob(dataDir, mountPoint string) error {
 	mfd, err := openComposefsMount(dataDir)
 	if err != nil {

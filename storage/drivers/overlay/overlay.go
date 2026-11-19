@@ -1632,7 +1632,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		}
 	}()
 
-	composeFsLayers := []string{}
 	maybeAddComposefsMount := func(lowerID string, i int, readWrite bool) (string, error) {
 		composefsBlob := d.getComposefsData(lowerID)
 		if err := fileutils.Exists(composefsBlob); err != nil {
@@ -1647,21 +1646,38 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			return "", fmt.Errorf("cannot mount a composefs layer as writeable")
 		}
 
+		blobDest := d.getStorePrivateDirectory(id, dir, fmt.Sprintf("composefs-layers/%d-blob", i), inAdditionalStore)
 		dest := d.getStorePrivateDirectory(id, dir, fmt.Sprintf("composefs-layers/%d", i), inAdditionalStore)
-		if err := os.MkdirAll(dest, 0o700); err != nil {
-			return "", err
+		for _, p := range []string{blobDest, dest} {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				return "", err
+			}
 		}
 
-		if err := mountComposefsBlob(composefsBlob, dest); err != nil {
+		if err := mountComposefsBlob(composefsBlob, blobDest); err != nil {
 			return "", err
 		}
-		composefsMounts = append(composefsMounts, dest)
+		composefsMounts = append(composefsMounts, blobDest)
+		if needsIDMapping && i > 0 {
+			// The blob holds the owners; the diff directory is data only.
+			if err := idmap.CreateIDMappedMount(blobDest, blobDest, idmappedMountProcessPid); err != nil {
+				return "", fmt.Errorf("create mapped mount for %q: %w", blobDest, err)
+			}
+			composefsMounts = append(composefsMounts, blobDest)
+		}
 		composeFsPath, err := d.getDiffPath(lowerID)
 		if err != nil {
 			return "", err
 		}
-		composeFsLayers = append(composeFsLayers, composeFsPath)
-		skipIDMappingLayers[composeFsPath] = composeFsPath
+		supportsDataOnly, err := d.getSupportsDataOnly()
+		if err != nil {
+			return "", err
+		}
+		if err := mountComposefsLayer(blobDest, composeFsPath, dest, supportsDataOnly, d.composefsMountOptions()); err != nil {
+			return "", err
+		}
+		composefsMounts = append(composefsMounts, dest)
+		skipIDMappingLayers[dest] = dest
 		return dest, nil
 	}
 
@@ -1691,19 +1707,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			return "", err
 		}
 		if composefsMount != "" {
-			if needsIDMapping {
-				if err := idmap.CreateIDMappedMount(composefsMount, composefsMount, idmappedMountProcessPid); err != nil {
-					return "", fmt.Errorf("create mapped mount for %q: %w", composefsMount, err)
-				}
-				skipIDMappingLayers[composefsMount] = composefsMount
-				// overlay takes a reference on the mount, so it is safe to unmount
-				// the mapped idmounts as soon as the final overlay file system is mounted.
-				defer func() {
-					if err := unix.Unmount(composefsMount, unix.MNT_DETACH); err != nil {
-						logrus.Warnf("Unmount %q: %v", composefsMount, err)
-					}
-				}()
-			}
 			absLowers = append(absLowers, composefsMount)
 			continue
 		}
@@ -1716,10 +1719,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			diffN++
 			err = fileutils.Exists(dumbJoin(lower, "..", nameWithSuffix("diff", diffN)))
 		}
-	}
-
-	if len(composeFsLayers) > 0 {
-		optsList = append(optsList, d.composefsMountOptions()...)
 	}
 
 	if len(absLowers) == 0 {
@@ -1802,21 +1801,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 	}
 
 	lowerDirs := strings.Join(absLowers, ":")
-	if len(composeFsLayers) > 0 {
-		sep := "::"
-		supportsDataOnly, err := d.getSupportsDataOnly()
-		if err != nil {
-			return "", err
-		}
-		if !supportsDataOnly {
-			sep = ":"
-		}
-		composeFsLayersLowerDirs := strings.Join(composeFsLayers, sep)
-		lowerDirs = lowerDirs + sep + composeFsLayersLowerDirs
-	}
-	// absLowers is not valid anymore now as we have added composeFsLayers to it, so prevent
-	// its usage.
-	absLowers = nil //nolint:ineffassign
 
 	var opts string
 	if readWrite {
