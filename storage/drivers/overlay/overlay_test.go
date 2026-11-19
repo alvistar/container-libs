@@ -305,6 +305,21 @@ func Test_parseOptions(t *testing.T) {
 			wantErr: "invalid syntax",
 		},
 		{
+			name:    "composefs_verity",
+			options: []string{"use_composefs=true", "composefs_verity=require"},
+			want:    &overlayOptions{useComposefs: true, composefsVerityRequired: true},
+		},
+		{
+			name:    "composefs_verity - invalid",
+			options: []string{"use_composefs=true", "composefs_verity=on"},
+			wantErr: `invalid value "on" for composefs_verity`,
+		},
+		{
+			name:    "composefs_verity - without use_composefs",
+			options: []string{"composefs_verity=require"},
+			wantErr: "composefs_verity requires use_composefs",
+		},
+		{
 			name:    "skip_mount_home",
 			options: []string{"skip_mount_home=true"},
 			want:    &overlayOptions{skipMountHome: true},
@@ -366,4 +381,14 @@ func Test_parseOptions(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestComposefsVerity(t *testing.T) {
+	d := &Driver{}
+	assert.Equal(t, graphdriver.DifferFsVerity(graphdriver.DifferFsVerityIfAvailable), d.composefsDifferFsVerity())
+	assert.Equal(t, []string{"metacopy=on", "redirect_dir=on"}, d.composefsMountOptions())
+
+	d.options.composefsVerityRequired = true
+	assert.Equal(t, graphdriver.DifferFsVerity(graphdriver.DifferFsVerityRequired), d.composefsDifferFsVerity())
+	assert.Equal(t, []string{"metacopy=on", "redirect_dir=on", "verity=require"}, d.composefsMountOptions())
 }

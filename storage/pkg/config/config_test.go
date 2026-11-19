@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -107,6 +108,12 @@ func TestOverlayOptions(t *testing.T) {
 	}
 	if !searchOptions(doptions, "use_composefs") {
 		t.Fatalf("Expected to find 'use_composefs' options, got %v", doptions)
+	}
+
+	options.Overlay.ComposefsVerity = "require"
+	doptions = GetGraphDriverOptions(options)
+	if !slices.Contains(doptions, "overlay.composefs_verity=require") {
+		t.Fatalf("Expected to find 'overlay.composefs_verity=require' option, got %v", doptions)
 	}
 
 	// Make sure Overlay.Size takes precedence

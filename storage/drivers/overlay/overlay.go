@@ -126,7 +126,10 @@ type overlayOptions struct {
 	ignoreChownErrors bool
 	forceMask         *os.FileMode
 	useComposefs      bool
-	syncMode          graphdriver.SyncMode
+	// composefsVerityRequired makes every composefs object carry an fs-verity
+	// digest and has the kernel check it on every open (overlay verity=require).
+	composefsVerityRequired bool
+	syncMode                graphdriver.SyncMode
 }
 
 // Driver contains information about the home directory and the list of active mounts that are created using this driver.
@@ -587,6 +590,12 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			if err != nil {
 				return nil, err
 			}
+		case "composefs_verity":
+			logrus.Debugf("overlay: composefs_verity=%s", val)
+			if val != "require" {
+				return nil, fmt.Errorf("invalid value %q for composefs_verity, only \"require\" is supported", val)
+			}
+			o.composefsVerityRequired = true
 		case "mount_program":
 			logrus.Debugf("overlay: mount_program=%s", val)
 			if val != "" {
@@ -644,7 +653,27 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			return nil, fmt.Errorf("unknown option %q (%q)", key, option)
 		}
 	}
+	if o.composefsVerityRequired && !o.useComposefs {
+		return nil, errors.New("composefs_verity requires use_composefs")
+	}
 	return o, nil
+}
+
+// composefsDifferFsVerity returns the fs-verity mode for the objects of a composefs layer.
+func (d *Driver) composefsDifferFsVerity() graphdriver.DifferFsVerity {
+	if d.options.composefsVerityRequired {
+		return graphdriver.DifferFsVerityRequired
+	}
+	return graphdriver.DifferFsVerityIfAvailable
+}
+
+// composefsMountOptions returns the overlay mount options needed when composefs layers are present.
+func (d *Driver) composefsMountOptions() []string {
+	opts := []string{"metacopy=on", "redirect_dir=on"}
+	if d.options.composefsVerityRequired {
+		opts = append(opts, "verity=require")
+	}
+	return opts
 }
 
 func cachedFeatureSet(feature string, set bool) string {
@@ -1690,7 +1719,7 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 	}
 
 	if len(composeFsLayers) > 0 {
-		optsList = append(optsList, "metacopy=on", "redirect_dir=on")
+		optsList = append(optsList, d.composefsMountOptions()...)
 	}
 
 	if len(absLowers) == 0 {
@@ -2247,7 +2276,7 @@ func (d *Driver) ApplyDiffWithDiffer(options *graphdriver.ApplyDiffWithDifferOpt
 	}
 	if d.usingComposefs {
 		differOptions.Format = graphdriver.DifferOutputFormatFlat
-		differOptions.UseFsVerity = graphdriver.DifferFsVerityIfAvailable
+		differOptions.UseFsVerity = d.composefsDifferFsVerity()
 	}
 	out, err := differ.ApplyDiff(applyDir, &archive.TarOptions{
 		UIDMaps:           idMappings.UIDs(),

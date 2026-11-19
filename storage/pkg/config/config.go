@@ -30,6 +30,8 @@ type OverlayOptionsConfig struct {
 	SkipMountHome string `toml:"skip_mount_home,omitempty"`
 	// Specify whether composefs must be used to mount the data layers
 	UseComposefs string `toml:"use_composefs,omitempty"`
+	// Set to "require" to require fs-verity for the data of composefs layers
+	ComposefsVerity string `toml:"composefs_verity,omitempty"`
 	// ForceMask indicates the permissions mask (e.g. "0755") to use for new
 	// files and directories
 	ForceMask string `toml:"force_mask,omitempty"`
@@ -162,6 +164,9 @@ func GetGraphDriverOptions(options OptionsConfig) []string {
 	}
 	if options.Overlay.UseComposefs != "" {
 		doptions = append(doptions, fmt.Sprintf("overlay.use_composefs=%s", options.Overlay.UseComposefs))
+	}
+	if options.Overlay.ComposefsVerity != "" {
+		doptions = append(doptions, fmt.Sprintf("overlay.composefs_verity=%s", options.Overlay.ComposefsVerity))
 	}
 	if options.Overlay.Sync != "" {
 		doptions = append(doptions, fmt.Sprintf("overlay.sync=%s", options.Overlay.Sync))

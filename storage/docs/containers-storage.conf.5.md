@@ -215,6 +215,9 @@ based file systems.
     Use ComposeFS to mount the data layers image.  ComposeFS support is experimental and not recommended for production use.
     This is a "string bool": "false"|"true" (cannot be native TOML boolean)
 
+**composefs_verity** = ""
+    Set to "require" to require fs-verity for the data of composefs layers.  Pulling a layer fails if fs-verity cannot be enabled on its files, and the overlay file system is mounted with `verity=require`, so the kernel checks the fs-verity digest of each file on open.  Requires **use_composefs** = "true" and a kernel that supports the overlay `verity` mount option (Linux 6.6 or later).
+
 **sync**="none|filesystem"
   Filesystem synchronization mode for layer creation. (default: "none")
 

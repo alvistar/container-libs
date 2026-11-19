@@ -297,8 +297,7 @@ const (
 	// the underlying kernel and filesystem.
 	DifferFsVerityIfAvailable
 
-	// DifferFsVerityRequired means fs-verity is required.  Note this is not
-	// currently set or exposed by the overlay driver.
+	// DifferFsVerityRequired means fs-verity is required.
 	DifferFsVerityRequired
 )
 
