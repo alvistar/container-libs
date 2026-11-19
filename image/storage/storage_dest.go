@@ -1164,7 +1164,9 @@ func (s *storageImageDestination) createNewLayer(ctx context.Context, index int,
 	}
 	var trustedOriginalDigest digest.Digest // For storage.LayerOptions
 	var trustedOriginalSize *int64
+	var fileDigest digest.Digest // The digest of the contents of filename, if known
 	if gotFilename {
+		fileDigest = trusted.blobDigest
 		// The code setting .filenames[trusted.blobDigest] is responsible for ensuring that the file contents match trusted.blobDigest.
 		trustedOriginalDigest = trusted.blobDigest
 		trustedOriginalSize = nil // It’s s.lockProtected.fileSizes[trusted.blobDigest], but we don’t hold the lock now, and the consumer can compute it at trivial cost.
@@ -1221,6 +1223,7 @@ func (s *storageImageDestination) createNewLayer(ctx context.Context, index int,
 		if trusted.diffID == "" && layer.UncompressedDigest != "" {
 			trusted.diffID = layer.UncompressedDigest // This data might have been unavailable in tryReusingBlobAsPending, and is only known now.
 		}
+		fileDigest = trusted.diffID // The file holds the uncompressed diff.
 
 		// Set the layer’s CompressedDigest/CompressedSize to relevant values if known, to allow more layer reuse.
 		// But we don’t want to just use the size from the manifest if we never saw the compressed blob,
@@ -1271,7 +1274,7 @@ func (s *storageImageDestination) createNewLayer(ctx context.Context, index int,
 	// fs-verity). Without this, a layer created here from a reused blob (the same blob on another parent) or from
 	// a local one (podman load, an oci-archive:) would be an ordinary layer, as if convert_images were off.
 	if convertsLayers(s.imageRef.transport.store) {
-		layer, converted, err := s.createConvertedLayer(ctx, trusted, parentLayer, newLayerID, file)
+		layer, converted, err := s.createConvertedLayer(ctx, trusted, parentLayer, newLayerID, file, fileDigest)
 		if converted || err != nil {
 			return layer, err
 		}
@@ -1735,14 +1738,24 @@ func (f fileBlobSource) GetBlobAt(chunks []chunked.ImageSourceChunk) (chan io.Re
 
 // createConvertedLayer creates newLayerID on parentLayer from the complete layer in file, through the converting
 // differ of c/storage/pkg/chunked. It returns converted == false, with no error, if the differ cannot be used (the
-// caller then creates an ordinary layer). The DiffID of the converted layer must match trusted.diffID when known.
-func (s *storageImageDestination) createConvertedLayer(ctx context.Context, trusted trustedLayerIdentityData, parentLayer, newLayerID string, file *os.File) (layer *storage.Layer, converted bool, retErr error) {
+// caller then creates an ordinary layer). fileDigest is the digest of the contents of file (the compressed blob, or
+// the uncompressed diff of an existing layer), or "" if unknown; the differ checks the file against it. The DiffID of
+// the converted layer must match trusted.diffID when known.
+func (s *storageImageDestination) createConvertedLayer(ctx context.Context, trusted trustedLayerIdentityData, parentLayer, newLayerID string, file *os.File, fileDigest digest.Digest) (layer *storage.Layer, converted bool, retErr error) {
 	st, err := file.Stat()
 	if err != nil {
 		return nil, false, err
 	}
+	if fileDigest == "" {
+		if fileDigest, err = digest.FromReader(file); err != nil {
+			return nil, false, fmt.Errorf("computing the digest of layer %s: %w", trusted.logString(), err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, false, err
+		}
+	}
 	// No annotations: without a TOC, the differ converts the whole layer.
-	differ, err := newConvertingDiffer(ctx, s.imageRef.transport.store, trusted.blobDigest, st.Size(), nil, fileBlobSource{file: file})
+	differ, err := newConvertingDiffer(ctx, s.imageRef.transport.store, fileDigest, st.Size(), nil, fileBlobSource{file: file})
 	if err != nil {
 		if _, ok := errors.AsType[chunked.ErrFallbackToOrdinaryLayerDownload](err); ok {
 			logrus.Debugf("Not converting layer %s: %v", trusted.logString(), err)

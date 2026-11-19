@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -31,11 +32,26 @@ type convertTestStore struct {
 	applied      []storage.ApplyStagedLayerOptions
 	cleanedUp    int
 	stagedOutput graphdriver.DriverWithDifferOutput
+
+	layers    []storage.Layer // found by LayersByUncompressedDigest and LayersByCompressedDigest
+	layerDiff []byte          // what Diff returns for them
 }
 
 func (s *convertTestStore) PullOptions() map[string]string { return s.pullOptions }
 
 func (s *convertTestStore) GraphDriver() (graphdriver.Driver, error) { return s.driver, nil }
+
+func (s *convertTestStore) LayersByUncompressedDigest(d digest.Digest) ([]storage.Layer, error) {
+	return s.layers, nil
+}
+
+func (s *convertTestStore) LayersByCompressedDigest(d digest.Digest) ([]storage.Layer, error) {
+	return s.layers, nil
+}
+
+func (s *convertTestStore) Diff(from, to string, options *storage.DiffOptions) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(s.layerDiff)), nil
+}
 
 func (s *convertTestStore) PutLayer(id, parent string, names []string, mountLabel string, writeable bool, options *storage.LayerOptions, diff io.Reader) (*storage.Layer, int64, error) {
 	s.putLayer++
@@ -85,7 +101,7 @@ func newConvertTestDestination(t *testing.T, pullOptions map[string]string, driv
 	store := &convertTestStore{pullOptions: pullOptions, driver: driver}
 	file := filepath.Join(t.TempDir(), "layer")
 	require.NoError(t, os.WriteFile(file, []byte("not a real tar, the differ is a fake"), 0o600))
-	dest := &storageImageDestination{imageRef: storageReference{transport: storageTransport{store: store}}}
+	dest := &storageImageDestination{imageRef: storageReference{transport: storageTransport{store: store}}, directory: t.TempDir()}
 	dest.lockProtected.filenames = map[digest.Digest]string{blobDigest: file}
 	dest.lockProtected.fileSizes = map[digest.Digest]int64{}
 	dest.lockProtected.blobDiffIDs = map[digest.Digest]digest.Digest{}
@@ -98,10 +114,11 @@ func TestCreateNewLayerConvertsWithConvertImages(t *testing.T) {
 	ctx := context.WithValue(context.Background(), struct{}{}, "the caller's context")
 	var differCtx context.Context
 	var differAnnotations map[string]string
+	var differDigest digest.Digest
 	origNewDiffer := newConvertingDiffer
 	t.Cleanup(func() { newConvertingDiffer = origNewDiffer })
 	newConvertingDiffer = func(ctx context.Context, store storage.Store, blobDigest digest.Digest, blobSize int64, annotations map[string]string, iss chunked.ImageSourceSeekable) (graphdriver.Differ, error) {
-		differCtx, differAnnotations = ctx, annotations
+		differCtx, differAnnotations, differDigest = ctx, annotations, blobDigest
 		return fakeDiffer{}, nil
 	}
 	trusted := trustedLayerIdentityData{diffID: diffID, blobDigest: blobDigest}
@@ -120,6 +137,32 @@ func TestCreateNewLayerConvertsWithConvertImages(t *testing.T) {
 	assert.Equal(t, diffID, store.applied[0].DiffOutput.UncompressedDigest)
 	assert.Same(t, ctx, differCtx, "the differ gets the caller's context")
 	assert.Empty(t, differAnnotations, "no TOC: the differ converts the whole layer")
+	assert.Equal(t, blobDigest, differDigest, "the differ checks the cached blob against its digest")
+
+	// a blob reused on another parent, with no cached file: the layer is created from the uncompressed diff of the
+	// existing layer, so the differ must check that diff against the DiffID, not against the (unknown) blob digest
+	dest, store = newConvertTestDestination(t, map[string]string{"enable_partial_images": "true", "convert_images": "true"}, differDriver{}, digest.FromString("another blob"))
+	store.layerDiff = []byte("the uncompressed diff of the existing layer")
+	reusedDiffID := digest.FromBytes(store.layerDiff)
+	store.layers = []storage.Layer{{ID: "existing", UncompressedDigest: reusedDiffID}}
+	store.stagedOutput = graphdriver.DriverWithDifferOutput{UncompressedDigest: reusedDiffID}
+	differDigest = "unset"
+	layer, err = dest.createNewLayer(ctx, 0, trustedLayerIdentityData{diffID: reusedDiffID}, "other-parent", "reused")
+	require.NoError(t, err)
+	assert.Equal(t, "reused", layer.ID)
+	assert.Equal(t, 0, store.putLayer)
+	require.Len(t, store.applied, 1)
+	assert.Equal(t, reusedDiffID, differDigest, "the file holds the uncompressed diff: its digest is the DiffID")
+
+	// the same, with no DiffID known for the existing layer: the digest of the file is computed
+	dest, store = newConvertTestDestination(t, map[string]string{"enable_partial_images": "true", "convert_images": "true"}, differDriver{}, digest.FromString("another blob"))
+	store.layerDiff = []byte("an uncompressed diff with no recorded digest")
+	store.layers = []storage.Layer{{ID: "existing"}}
+	store.stagedOutput = graphdriver.DriverWithDifferOutput{UncompressedDigest: digest.FromBytes(store.layerDiff)}
+	differDigest = "unset"
+	_, err = dest.createNewLayer(ctx, 0, trustedLayerIdentityData{blobDigest: digest.FromString("unknown blob")}, "other-parent", "reused")
+	require.NoError(t, err)
+	assert.Equal(t, digest.FromBytes(store.layerDiff), differDigest)
 
 	// the converted layer has another DiffID: refused, the staged layer cleaned up, nothing applied
 	dest, store = newConvertTestDestination(t, map[string]string{"enable_partial_images": "true", "convert_images": "true"}, differDriver{}, blobDigest)
