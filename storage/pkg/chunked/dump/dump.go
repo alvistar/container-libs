@@ -228,14 +228,22 @@ const overlayOpaqueXattr = "trusted.overlay.opaque"
 // archive.overlayWhiteoutConverter): ".wh.NAME" becomes a 0/0 character
 // device NAME, and ".wh..wh..opq" sets the opaque xattr on its directory.
 // A whiteout below another whiteout or an opaque directory, or with an entry
-// of the layer at its name, is dropped.  entries is not modified, and is
+// of the layer at its name, is dropped.  An opaque directory with no entry of
+// its own is added before its first entry.  entries is not modified, and is
 // returned as is when it has no whiteouts.
 func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, error) {
 	dirs := make(map[string]struct{})
 	opaqueDirs := make(map[string]struct{})
 	whiteouts := make(map[string]struct{})
-	// present holds the entries of the layer that are not whiteouts.
+	// present holds the entries of the layer that are not whiteouts, parents
+	// the directories above them and above the opaque markers.
 	present := make(map[string]struct{})
+	parents := make(map[string]struct{})
+	addParents := func(dir string) {
+		for ; dir != "/"; dir = filepath.Dir(dir) {
+			parents[dir] = struct{}{}
+		}
+	}
 	for _, e := range entries {
 		path := createpath.CleanAbsPath(e.Name)
 		dir, base := filepath.Dir(path), filepath.Base(path)
@@ -244,6 +252,7 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 		}
 		if base == archive.WhiteoutOpaqueDir {
 			opaqueDirs[dir] = struct{}{}
+			addParents(dir)
 		} else if target, ok := strings.CutPrefix(base, archive.WhiteoutPrefix); ok {
 			if target == "" || target == "." || target == ".." {
 				return nil, fmt.Errorf("invalid whiteout path %q", e.Name)
@@ -251,6 +260,7 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 			whiteouts[filepath.Join(dir, target)] = struct{}{}
 		} else {
 			present[path] = struct{}{}
+			addParents(dir)
 		}
 	}
 	if len(opaqueDirs) == 0 && len(whiteouts) == 0 {
@@ -259,8 +269,19 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 	// A whiteout applies to the lower layers only: an entry of the layer with
 	// the same name stays, and a directory hides the lower one as a whole.
 	for target := range whiteouts {
-		if _, found := dirs[target]; found {
+		_, isDir := dirs[target]
+		_, isParent := parents[target]
+		if _, isEntry := present[target]; isDir || (isParent && !isEntry) {
 			opaqueDirs[target] = struct{}{}
+			present[target] = struct{}{}
+		}
+	}
+	// implicitDirs are the opaque directories with no entry of their own;
+	// each is added before the first entry at or below it.
+	implicitDirs := make(map[string]struct{})
+	for dir := range opaqueDirs {
+		if _, found := dirs[dir]; !found {
+			implicitDirs[dir] = struct{}{}
 		}
 	}
 
@@ -274,21 +295,34 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 	}
 
 	res := make([]minimal.FileMetadata, 0, len(entries))
+	// addImplicitDirs adds the implicit directories at or above path that are
+	// not added yet, the outermost first.
+	addImplicitDirs := func(path string) {
+		var pending []string
+		for p := path; ; p = filepath.Dir(p) {
+			if _, found := implicitDirs[p]; found {
+				pending = append(pending, p)
+				delete(implicitDirs, p)
+			}
+			if p == "/" {
+				break
+			}
+		}
+		for i := len(pending) - 1; i >= 0; i-- {
+			res = append(res, minimal.FileMetadata{
+				Name:   pending[i],
+				Type:   minimal.TypeDir,
+				Mode:   0o755,
+				Xattrs: opaqueXattrs(nil),
+			})
+		}
+	}
 	for _, e := range entries {
 		path := createpath.CleanAbsPath(e.Name)
 		dir, base := filepath.Dir(path), filepath.Base(path)
 		switch {
 		case base == archive.WhiteoutOpaqueDir:
-			if _, found := dirs[dir]; !found {
-				// The directory has no entry of its own: add one.
-				dirs[dir] = struct{}{}
-				res = append(res, minimal.FileMetadata{
-					Name:   dir,
-					Type:   minimal.TypeDir,
-					Mode:   0o755,
-					Xattrs: opaqueXattrs(nil),
-				})
-			}
+			addImplicitDirs(dir)
 		case strings.HasPrefix(base, archive.WhiteoutPrefix):
 			target := filepath.Join(dir, strings.TrimPrefix(base, archive.WhiteoutPrefix))
 			if _, found := present[target]; found {
@@ -307,6 +341,7 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 			if hidden {
 				continue
 			}
+			addImplicitDirs(dir)
 			res = append(res, minimal.FileMetadata{
 				Name:    target,
 				Type:    minimal.TypeChar,
@@ -318,6 +353,7 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 			if _, found := opaqueDirs[path]; found && e.Type == minimal.TypeDir {
 				e.Xattrs = opaqueXattrs(e.Xattrs)
 			}
+			addImplicitDirs(dir)
 			res = append(res, e)
 		}
 	}

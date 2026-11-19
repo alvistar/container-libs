@@ -372,6 +372,34 @@ func TestGenerateDumpWhiteoutReplaced(t *testing.T) {
 	}
 }
 
+func TestGenerateDumpWhiteoutImplicitDir(t *testing.T) {
+	// A directory can have no entry of its own in the layer.  When it
+	// replaces a whiteout or holds an opaque marker, it is added as an opaque
+	// directory before its first child, whatever the order of the TOC.
+	modTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	toc := &minimal.TOC{
+		Entries: []minimal.FileMetadata{
+			{Name: "./", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "d/f", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: ".wh.d", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "e/.wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: ".wh.e", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "g/h", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "g/.wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+		},
+	}
+	expected := "/ 0 40755 1 0 0 0 1672531200.0 - - -\n" +
+		"/d 0 40755 1 0 0 0 0.0 - - - trusted.overlay.opaque=y\n" +
+		"/d/f 0 100644 1 0 0 0 1672531200.0 - - -\n" +
+		"/e 0 40755 1 0 0 0 0.0 - - - trusted.overlay.opaque=y\n" +
+		"/g 0 40755 1 0 0 0 0.0 - - - trusted.overlay.opaque=y\n" +
+		"/g/h 0 100644 1 0 0 0 1672531200.0 - - -\n"
+
+	if actual := generateDumpString(t, toc); actual != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", actual, expected)
+	}
+}
+
 func TestGenerateDumpWhiteoutInvalid(t *testing.T) {
 	for _, name := range []string{"a/.wh.", "a/.wh..", "a/.wh..."} {
 		toc := &minimal.TOC{Entries: []minimal.FileMetadata{{Name: name, Type: minimal.TypeReg}}}
