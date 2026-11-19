@@ -14,6 +14,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	"go.podman.io/storage/internal/createpath"
+	"go.podman.io/storage/pkg/archive"
 	"go.podman.io/storage/pkg/chunked/internal/minimal"
 	storagePath "go.podman.io/storage/pkg/chunked/internal/path"
 	"golang.org/x/sys/unix"
@@ -218,6 +219,90 @@ func dumpNode(out io.Writer, added map[string]*minimal.FileMetadata, links map[s
 	return nil
 }
 
+// overlayOpaqueXattr marks an opaque directory for overlay.  composefs is not
+// supported in a user namespace, so it is never user.overlay.opaque.
+const overlayOpaqueXattr = "trusted.overlay.opaque"
+
+// convertWhiteouts returns entries with the AUFS whiteouts of the layer in the
+// overlay format, as the non-composefs path writes them (see
+// archive.overlayWhiteoutConverter): ".wh.NAME" becomes a 0/0 character
+// device NAME, and ".wh..wh..opq" sets the opaque xattr on its directory.
+// A whiteout below another whiteout is dropped.  entries is not modified, and
+// is returned as is when it has no whiteouts.
+func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, error) {
+	dirs := make(map[string]struct{})
+	opaqueDirs := make(map[string]struct{})
+	whiteouts := make(map[string]struct{})
+	for _, e := range entries {
+		path := createpath.CleanAbsPath(e.Name)
+		dir, base := filepath.Dir(path), filepath.Base(path)
+		if e.Type == minimal.TypeDir {
+			dirs[path] = struct{}{}
+		}
+		if base == archive.WhiteoutOpaqueDir {
+			opaqueDirs[dir] = struct{}{}
+		} else if target, ok := strings.CutPrefix(base, archive.WhiteoutPrefix); ok {
+			if target == "" || target == "." || target == ".." {
+				return nil, fmt.Errorf("invalid whiteout path %q", e.Name)
+			}
+			whiteouts[filepath.Join(dir, target)] = struct{}{}
+		}
+	}
+	if len(opaqueDirs) == 0 && len(whiteouts) == 0 {
+		return entries, nil
+	}
+
+	opaqueXattrs := func(xattrs map[string]string) map[string]string {
+		res := make(map[string]string, len(xattrs)+1)
+		for k, v := range xattrs {
+			res[k] = v
+		}
+		res[overlayOpaqueXattr] = base64.StdEncoding.EncodeToString([]byte{'y'})
+		return res
+	}
+
+	res := make([]minimal.FileMetadata, 0, len(entries))
+	for _, e := range entries {
+		path := createpath.CleanAbsPath(e.Name)
+		dir, base := filepath.Dir(path), filepath.Base(path)
+		switch {
+		case base == archive.WhiteoutOpaqueDir:
+			if _, found := dirs[dir]; !found {
+				// The directory has no entry of its own: add one.
+				dirs[dir] = struct{}{}
+				res = append(res, minimal.FileMetadata{
+					Name:   dir,
+					Type:   minimal.TypeDir,
+					Mode:   0o755,
+					Xattrs: opaqueXattrs(nil),
+				})
+			}
+		case strings.HasPrefix(base, archive.WhiteoutPrefix):
+			target := filepath.Join(dir, strings.TrimPrefix(base, archive.WhiteoutPrefix))
+			underWhiteout := false
+			for p := dir; p != "/" && !underWhiteout; p = filepath.Dir(p) {
+				_, underWhiteout = whiteouts[p]
+			}
+			if underWhiteout {
+				continue
+			}
+			res = append(res, minimal.FileMetadata{
+				Name:    target,
+				Type:    minimal.TypeChar,
+				UID:     e.UID,
+				GID:     e.GID,
+				ModTime: e.ModTime,
+			})
+		default:
+			if _, found := opaqueDirs[path]; found && e.Type == minimal.TypeDir {
+				e.Xattrs = opaqueXattrs(e.Xattrs)
+			}
+			res = append(res, e)
+		}
+	}
+	return res, nil
+}
+
 // GenerateDump generates a dump of the TOC in the same format as `composefs-info dump`
 func GenerateDump(tocI any, verityDigests map[string]string) (io.Reader, error) {
 	toc, ok := tocI.(*minimal.TOC)
@@ -235,9 +320,16 @@ func GenerateDump(tocI any, verityDigests map[string]string) (io.Reader, error) 
 			}
 		}()
 
+		entries, err := convertWhiteouts(toc.Entries)
+		if err != nil {
+			pipeW.CloseWithError(err)
+			closed = true
+			return
+		}
+
 		links := make(map[string]int)
 		added := make(map[string]*minimal.FileMetadata)
-		for _, e := range toc.Entries {
+		for _, e := range entries {
 			if e.Linkname == "" {
 				continue
 			}
@@ -247,7 +339,7 @@ func GenerateDump(tocI any, verityDigests map[string]string) (io.Reader, error) 
 			links[e.Linkname] = links[e.Linkname] + 1
 		}
 
-		if len(toc.Entries) == 0 {
+		if len(entries) == 0 {
 			root := &minimal.FileMetadata{
 				Name: "/",
 				Type: minimal.TypeDir,
@@ -261,7 +353,7 @@ func GenerateDump(tocI any, verityDigests map[string]string) (io.Reader, error) 
 			}
 		}
 
-		for _, e := range toc.Entries {
+		for _, e := range entries {
 			if e.Type == minimal.TypeChunk {
 				continue
 			}

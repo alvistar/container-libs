@@ -252,3 +252,61 @@ func TestDumpNode(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateDumpWhiteouts(t *testing.T) {
+	modTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	toc := &minimal.TOC{
+		Entries: []minimal.FileMetadata{
+			{Name: "./", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "UIpackage/", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "UIpackage/.wh.FlexUI.exe", Type: minimal.TypeReg, Mode: 0o644, UID: 1000, GID: 1000, ModTime: &modTime},
+			{Name: "opq/", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "opq/.wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "opq/new", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			// The opaque marker can come without an entry for its directory.
+			{Name: "implicit/.wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			// A whiteout below a whiteout is dropped, as the non-composefs path does on ENOTDIR.
+			{Name: ".wh.gone", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "gone/.wh.child", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+		},
+	}
+	expected := "/ 0 40755 1 0 0 0 1672531200.0 - - -\n" +
+		"/UIpackage 0 40755 1 0 0 0 1672531200.0 - - -\n" +
+		"/UIpackage/FlexUI.exe 0 20000 1 1000 1000 0 1672531200.0 - - -\n" +
+		"/opq 0 40755 1 0 0 0 1672531200.0 - - - trusted.overlay.opaque=y\n" +
+		"/opq/new 0 100644 1 0 0 0 1672531200.0 - - -\n" +
+		"/implicit 0 40755 1 0 0 0 0.0 - - - trusted.overlay.opaque=y\n" +
+		"/gone 0 20000 1 0 0 0 1672531200.0 - - -\n"
+
+	r, err := GenerateDump(toc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	if actual := buf.String(); actual != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", actual, expected)
+	}
+
+	// TOC entries are not changed: the TOC is also stored with the layer.
+	if toc.Entries[2].Name != "UIpackage/.wh.FlexUI.exe" || toc.Entries[3].Xattrs != nil {
+		t.Errorf("GenerateDump changed the TOC: %+v %+v", toc.Entries[2], toc.Entries[3])
+	}
+}
+
+func TestGenerateDumpWhiteoutInvalid(t *testing.T) {
+	for _, name := range []string{"a/.wh.", "a/.wh..", "a/.wh..."} {
+		toc := &minimal.TOC{Entries: []minimal.FileMetadata{{Name: name, Type: minimal.TypeReg}}}
+		r, err := GenerateDump(toc, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		// The targets are "", "." and "..".
+		if _, err := buf.ReadFrom(r); err == nil {
+			t.Errorf("%q: expected an error, got dump %q", name, buf.String())
+		}
+	}
+}
