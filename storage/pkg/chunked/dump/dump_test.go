@@ -296,6 +296,82 @@ func TestGenerateDumpWhiteouts(t *testing.T) {
 	}
 }
 
+func generateDumpString(t *testing.T, toc *minimal.TOC) string {
+	t.Helper()
+	r, err := GenerateDump(toc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func TestGenerateDumpWhiteoutInOpaqueDir(t *testing.T) {
+	// mkcomposefs marks a directory holding a whiteout with an opaque value
+	// that replaces "y", so the lower entries would show again.  The opaque
+	// directory already hides them: the whiteout is dropped.
+	modTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	toc := &minimal.TOC{
+		Entries: []minimal.FileMetadata{
+			{Name: "./", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "opq/", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "opq/.wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "opq/.wh.old", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "opq/sub/", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "opq/sub/.wh.deep", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+		},
+	}
+	expected := "/ 0 40755 1 0 0 0 1672531200.0 - - -\n" +
+		"/opq 0 40755 1 0 0 0 1672531200.0 - - - trusted.overlay.opaque=y\n" +
+		"/opq/sub 0 40755 1 0 0 0 1672531200.0 - - -\n"
+
+	if actual := generateDumpString(t, toc); actual != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", actual, expected)
+	}
+
+	// Overlay always merges the root of a layer, so an opaque root hides
+	// nothing and a whiteout at the root is kept.
+	toc = &minimal.TOC{
+		Entries: []minimal.FileMetadata{
+			{Name: "./", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: ".wh..wh..opq", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: ".wh.old", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+		},
+	}
+	expected = "/ 0 40755 1 0 0 0 1672531200.0 - - - trusted.overlay.opaque=y\n" +
+		"/old 0 20000 1 0 0 0 1672531200.0 - - -\n"
+	if actual := generateDumpString(t, toc); actual != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", actual, expected)
+	}
+}
+
+func TestGenerateDumpWhiteoutReplaced(t *testing.T) {
+	// A whiteout applies to the lower layers only: an entry of the same layer
+	// with its name stays, and a directory hides the lower one as a whole.
+	modTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	toc := &minimal.TOC{
+		Entries: []minimal.FileMetadata{
+			{Name: "./", Type: minimal.TypeDir, Mode: 0o755, ModTime: &modTime},
+			{Name: "file", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: ".wh.file", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: ".wh.dir", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+			{Name: "dir/", Type: minimal.TypeDir, Mode: 0o700, ModTime: &modTime},
+			{Name: "dir/new", Type: minimal.TypeReg, Mode: 0o644, ModTime: &modTime},
+		},
+	}
+	expected := "/ 0 40755 1 0 0 0 1672531200.0 - - -\n" +
+		"/file 0 100644 1 0 0 0 1672531200.0 - - -\n" +
+		"/dir 0 40700 1 0 0 0 1672531200.0 - - - trusted.overlay.opaque=y\n" +
+		"/dir/new 0 100644 1 0 0 0 1672531200.0 - - -\n"
+
+	if actual := generateDumpString(t, toc); actual != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", actual, expected)
+	}
+}
+
 func TestGenerateDumpWhiteoutInvalid(t *testing.T) {
 	for _, name := range []string{"a/.wh.", "a/.wh..", "a/.wh..."} {
 		toc := &minimal.TOC{Entries: []minimal.FileMetadata{{Name: name, Type: minimal.TypeReg}}}

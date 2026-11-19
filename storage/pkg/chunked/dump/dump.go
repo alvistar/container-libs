@@ -227,12 +227,15 @@ const overlayOpaqueXattr = "trusted.overlay.opaque"
 // overlay format, as the non-composefs path writes them (see
 // archive.overlayWhiteoutConverter): ".wh.NAME" becomes a 0/0 character
 // device NAME, and ".wh..wh..opq" sets the opaque xattr on its directory.
-// A whiteout below another whiteout is dropped.  entries is not modified, and
-// is returned as is when it has no whiteouts.
+// A whiteout below another whiteout or an opaque directory, or with an entry
+// of the layer at its name, is dropped.  entries is not modified, and is
+// returned as is when it has no whiteouts.
 func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, error) {
 	dirs := make(map[string]struct{})
 	opaqueDirs := make(map[string]struct{})
 	whiteouts := make(map[string]struct{})
+	// present holds the entries of the layer that are not whiteouts.
+	present := make(map[string]struct{})
 	for _, e := range entries {
 		path := createpath.CleanAbsPath(e.Name)
 		dir, base := filepath.Dir(path), filepath.Base(path)
@@ -246,10 +249,19 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 				return nil, fmt.Errorf("invalid whiteout path %q", e.Name)
 			}
 			whiteouts[filepath.Join(dir, target)] = struct{}{}
+		} else {
+			present[path] = struct{}{}
 		}
 	}
 	if len(opaqueDirs) == 0 && len(whiteouts) == 0 {
 		return entries, nil
+	}
+	// A whiteout applies to the lower layers only: an entry of the layer with
+	// the same name stays, and a directory hides the lower one as a whole.
+	for target := range whiteouts {
+		if _, found := dirs[target]; found {
+			opaqueDirs[target] = struct{}{}
+		}
 	}
 
 	opaqueXattrs := func(xattrs map[string]string) map[string]string {
@@ -279,11 +291,20 @@ func convertWhiteouts(entries []minimal.FileMetadata) ([]minimal.FileMetadata, e
 			}
 		case strings.HasPrefix(base, archive.WhiteoutPrefix):
 			target := filepath.Join(dir, strings.TrimPrefix(base, archive.WhiteoutPrefix))
-			underWhiteout := false
-			for p := dir; p != "/" && !underWhiteout; p = filepath.Dir(p) {
-				_, underWhiteout = whiteouts[p]
+			if _, found := present[target]; found {
+				continue
 			}
-			if underWhiteout {
+			// Below another whiteout or an opaque directory there is nothing
+			// of the lower layers to hide.  Overlay merges the root of a
+			// layer even when it is opaque.
+			hidden := false
+			for p := dir; p != "/" && !hidden; p = filepath.Dir(p) {
+				_, hidden = whiteouts[p]
+				if _, opaque := opaqueDirs[p]; opaque {
+					hidden = true
+				}
+			}
+			if hidden {
 				continue
 			}
 			res = append(res, minimal.FileMetadata{
