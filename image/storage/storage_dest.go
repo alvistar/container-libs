@@ -249,7 +249,7 @@ func (s *storageImageDestination) PutBlobWithOptions(ctx context.Context, stream
 		return info, nil
 	}
 
-	return info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
+	return info, s.queueOrCommit(ctx, *options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
 		emptyLayer: options.EmptyLayer,
 	})
@@ -494,12 +494,12 @@ func (s *storageImageDestination) PutBlobPartial(ctx context.Context, chunkAcces
 
 	succeeded = true
 	return private.UploadedBlob{
-		Digest: blobDigest,
-		Size:   srcInfo.Size,
-	}, s.queueOrCommit(options.LayerIndex, addedLayerInfo{
-		digest:     blobDigest,
-		emptyLayer: options.EmptyLayer,
-	})
+			Digest: blobDigest,
+			Size:   srcInfo.Size,
+		}, s.queueOrCommit(ctx, options.LayerIndex, addedLayerInfo{
+			digest:     blobDigest,
+			emptyLayer: options.EmptyLayer,
+		})
 }
 
 // TryReusingBlobWithOptions checks whether the transport already contains, or can efficiently reuse, a blob, and if so, applies it to the current destination
@@ -516,7 +516,7 @@ func (s *storageImageDestination) TryReusingBlobWithOptions(ctx context.Context,
 		return reused, info, err
 	}
 
-	return reused, info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
+	return reused, info, s.queueOrCommit(ctx, *options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
 		emptyLayer: options.EmptyLayer,
 	})
@@ -887,7 +887,7 @@ func (s *storageImageDestination) getConfigBlob(info types.BlobInfo) ([]byte, er
 // queueOrCommit queues the specified layer to be committed to the storage.
 // If no other goroutine is already committing layers, the layer and all
 // subsequent layers (if already queued) will be committed to the storage.
-func (s *storageImageDestination) queueOrCommit(index int, info addedLayerInfo) error {
+func (s *storageImageDestination) queueOrCommit(ctx context.Context, index int, info addedLayerInfo) error {
 	// NOTE: whenever the code below is touched, make sure that all code
 	// paths unlock the lock and to unlock it exactly once.
 	//
@@ -923,7 +923,7 @@ func (s *storageImageDestination) queueOrCommit(index int, info addedLayerInfo) 
 		}
 		s.lock.Unlock()
 		// Note: commitLayer locks on-demand.
-		if stopQueue, err := s.commitLayer(index, info, -1); stopQueue || err != nil {
+		if stopQueue, err := s.commitLayer(ctx, index, info, -1); stopQueue || err != nil {
 			return err
 		}
 		s.lock.Lock()
@@ -947,7 +947,7 @@ func (s *storageImageDestination) queueOrCommit(index int, info addedLayerInfo) 
 // Caution: this function must be called without holding `s.lock`.  Callers
 // must guarantee that, at any given time, at most one goroutine may execute
 // `commitLayer()`.
-func (s *storageImageDestination) commitLayer(index int, info addedLayerInfo, size int64) (bool, error) {
+func (s *storageImageDestination) commitLayer(ctx context.Context, index int, info addedLayerInfo, size int64) (bool, error) {
 	if _, alreadyCommitted := s.indexToStorageID[index]; alreadyCommitted {
 		return false, nil
 	}
@@ -1044,7 +1044,7 @@ func (s *storageImageDestination) commitLayer(index int, info addedLayerInfo, si
 		return false, nil
 	}
 
-	layer, err := s.createNewLayer(index, trusted, parentLayer, id)
+	layer, err := s.createNewLayer(ctx, index, trusted, parentLayer, id)
 	if err != nil {
 		return false, err
 	}
@@ -1076,7 +1076,7 @@ func layerID(parentID string, trusted trustedLayerIdentityData) string {
 
 // createNewLayer creates a new layer newLayerID for (index, trusted) on top of parentLayer (which may be "").
 // If the layer cannot be committed yet, the function returns (nil, nil).
-func (s *storageImageDestination) createNewLayer(index int, trusted trustedLayerIdentityData, parentLayer, newLayerID string) (*storage.Layer, error) {
+func (s *storageImageDestination) createNewLayer(ctx context.Context, index int, trusted trustedLayerIdentityData, parentLayer, newLayerID string) (*storage.Layer, error) {
 	s.lock.Lock()
 	diffOutput, ok := s.lockProtected.diffOutputs[index]
 	s.lock.Unlock()
@@ -1266,6 +1266,19 @@ func (s *storageImageDestination) createNewLayer(index int, trusted trustedLayer
 		return nil, fmt.Errorf("opening file %q: %w", filename, err)
 	}
 	defer file.Close()
+	// With convert_images, a layer that was not pulled partially is converted, so that the graph driver stores it
+	// as it stores a partially-pulled layer (for overlay with composefs: a composefs blob and objects with
+	// fs-verity). Without this, a layer created here from a reused blob (the same blob on another parent) or from
+	// a local one (podman load, an oci-archive:) would be an ordinary layer, as if convert_images were off.
+	if convertsLayers(s.imageRef.transport.store) {
+		layer, converted, err := s.createConvertedLayer(ctx, trusted, parentLayer, newLayerID, file)
+		if converted || err != nil {
+			return layer, err
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
 	// Build the new layer using the diff, regardless of where it came from.
 	// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
 	layer, _, err := s.imageRef.transport.store.PutLayer(newLayerID, parentLayer, nil, "", false, &storage.LayerOptions{
@@ -1452,7 +1465,7 @@ func (s *storageImageDestination) CommitWithOptions(ctx context.Context, options
 
 	// Extract, commit, or find the layers.
 	for i, blob := range layerBlobs {
-		if stopQueue, err := s.commitLayer(i, addedLayerInfo{
+		if stopQueue, err := s.commitLayer(ctx, i, addedLayerInfo{
 			digest:     blob.Digest,
 			emptyLayer: blob.EmptyLayer,
 		}, blob.Size); err != nil {
@@ -1683,4 +1696,87 @@ func (s *storageImageDestination) PutSignaturesWithFormat(ctx context.Context, s
 		s.metadata.SignaturesSizes[*instanceDigest] = sizes
 	}
 	return nil
+}
+
+// newConvertingDiffer creates the differ of createConvertedLayer; a variable so that tests can replace it.
+var newConvertingDiffer = chunked.NewDiffer
+
+// convertsLayers returns true if layers created from a complete blob must be converted: convert_images is set, and
+// the graph driver stores the output of a differ.
+func convertsLayers(store storage.Store) bool {
+	if store.PullOptions()["convert_images"] != "true" {
+		return false
+	}
+	driver, err := store.GraphDriver()
+	if err != nil {
+		return false
+	}
+	_, ok := driver.(graphdriver.DriverWithDiffer)
+	return ok
+}
+
+// fileBlobSource serves byte ranges of a local file as a chunked.ImageSourceSeekable.
+type fileBlobSource struct {
+	file *os.File
+}
+
+func (f fileBlobSource) GetBlobAt(chunks []chunked.ImageSourceChunk) (chan io.ReadCloser, chan error, error) {
+	streams := make(chan io.ReadCloser)
+	errs := make(chan error)
+	go func() {
+		defer close(streams)
+		defer close(errs)
+		for _, c := range chunks {
+			streams <- io.NopCloser(io.NewSectionReader(f.file, int64(c.Offset), int64(c.Length)))
+		}
+	}()
+	return streams, errs, nil
+}
+
+// createConvertedLayer creates newLayerID on parentLayer from the complete layer in file, through the converting
+// differ of c/storage/pkg/chunked. It returns converted == false, with no error, if the differ cannot be used (the
+// caller then creates an ordinary layer). The DiffID of the converted layer must match trusted.diffID when known.
+func (s *storageImageDestination) createConvertedLayer(ctx context.Context, trusted trustedLayerIdentityData, parentLayer, newLayerID string, file *os.File) (layer *storage.Layer, converted bool, retErr error) {
+	st, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	// No annotations: without a TOC, the differ converts the whole layer.
+	differ, err := newConvertingDiffer(ctx, s.imageRef.transport.store, trusted.blobDigest, st.Size(), nil, fileBlobSource{file: file})
+	if err != nil {
+		if _, ok := errors.AsType[chunked.ErrFallbackToOrdinaryLayerDownload](err); ok {
+			logrus.Debugf("Not converting layer %s: %v", trusted.logString(), err)
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("converting layer %s: %w", trusted.logString(), err)
+	}
+	defer differ.Close()
+	out, err := s.imageRef.transport.store.PrepareStagedLayer(nil, differ)
+	if err != nil {
+		return nil, false, fmt.Errorf("converting layer %s: %w", trusted.logString(), err)
+	}
+	defer func() {
+		if retErr != nil {
+			if err := s.imageRef.transport.store.CleanupStagedLayer(out); err != nil {
+				logrus.Debugf("Error cleaning up the staged layer of %s: %v", trusted.logString(), err)
+			}
+		}
+	}()
+	if trusted.diffID != "" {
+		if out.UncompressedDigest != "" && out.UncompressedDigest != trusted.diffID {
+			return nil, false, fmt.Errorf("converted layer %s has the uncompressed digest %q, expected %q",
+				trusted.logString(), out.UncompressedDigest, trusted.diffID)
+		}
+		out.UncompressedDigest = trusted.diffID
+	}
+	layer, err = s.imageRef.transport.store.ApplyStagedLayer(storage.ApplyStagedLayerOptions{
+		ID:          newLayerID,
+		ParentLayer: parentLayer,
+		DiffOutput:  out,
+		DiffOptions: &graphdriver.ApplyDiffWithDifferOpts{},
+	})
+	if err != nil && !errors.Is(err, storage.ErrDuplicateID) {
+		return nil, false, fmt.Errorf("adding converted layer %s: %w", trusted.logString(), err)
+	}
+	return layer, true, nil
 }
