@@ -1314,7 +1314,17 @@ func reopenFileReadOnly(f *os.File) (*os.File, error) {
 func (c *chunkedDiffer) findAndCopyFile(dirfd int, r *fileMetadata, copyOptions *findAndCopyFileOptions, mode os.FileMode) (bool, error) {
 	finalizeFile := func(roFile *os.File) error {
 		if roFile == nil {
-			return nil
+			// The file was deduplicated with a hard link: keep the attributes
+			// it has in the other layer, but record its fs-verity digest.
+			if c.useFsVerity == graphdriver.DifferFsVerityDisabled {
+				return nil
+			}
+			f, err := openFileUnderRoot(dirfd, r.Name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			return c.recordFsVerity(r.Name, f)
 		}
 		defer roFile.Close()
 
